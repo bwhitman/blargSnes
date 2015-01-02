@@ -110,7 +110,7 @@ void PPU_Init()
 	PPU.MainBuffer = (u16*)linearAlloc(256*512*2);
 	PPU.SubBuffer = &PPU.MainBuffer[256*256];
 	
-	PPU.ScreenHeight = 224;
+	SNES_Status->ScreenHeight = 224;
 	
 	PPU.SubBackdrop = 0x0001;
 	
@@ -168,7 +168,6 @@ void PPU_Reset()
 	
 	memset(&PPU, 0, sizeof(PPUState));
 	
-	PPU.ScreenHeight = 224;
 	ApplyScaling();
 	
 	PPU.HardwareRenderer = hardrend;
@@ -311,16 +310,53 @@ inline void PPU_SetColor(u32 num, u16 val)
 		PPU.Palette[num] = temp;
 }
 
+u32 PPU_TranslateVRAMAddress(u32 addr)
+{
+	switch (PPU.VRAMInc & 0x0C)
+	{
+		case 0x00: return addr;
+		
+		case 0x04:
+			return (addr & 0x1FE01) |
+				  ((addr & 0x001C0) >> 5) |
+				  ((addr & 0x0003E) << 3);
+				  
+		case 0x08:
+			return (addr & 0x1FC01) |
+				  ((addr & 0x00380) >> 6) |
+				  ((addr & 0x0007E) << 3);
+				  
+		case 0x0C:
+			return (addr & 0x1F801) |
+				  ((addr & 0x00700) >> 7) |
+				  ((addr & 0x000FE) << 3);
+	}
+}
+
 
 void PPU_LatchHVCounters()
 {
-	// TODO simulate this one based on CPU cycle counter
-	PPU.OPHCT = 22;
+	if (!(SNES_WRIO & 0x80)) return;
 	
-	PPU.OPVCT = 1 + PPU.VCount;
-	if (PPU.OPVCT > 261) PPU.OPVCT = 0;
+	PPU.OPHCT = 22 + (SNES_Status->HCount >> 2);
+	if (PPU.OPHCT >= 340) PPU.OPHCT -= 340;
+	
+	PPU.OPVCT = SNES_Status->VCount;
 	
 	PPU.OPLatch = 0x40;
+}
+
+
+void SPC_Compensate()
+{
+	int cyclenow = (SNES_Status->HCount * SNES_Status->SPC_CycleRatio);
+	int torun = cyclenow - SNES_Status->SPC_LastCycle;
+	torun >>= 24;
+	if (torun > 0)
+	{
+		SPC_Run(torun);
+		SNES_Status->SPC_LastCycle = cyclenow;
+	}
 }
 
 
@@ -335,6 +371,7 @@ u8 PPU_Read8(u32 addr)
 		
 		case 0x37:
 			PPU_LatchHVCounters();
+			ret = 0x21;
 			break;
 			
 		case 0x38:
@@ -351,7 +388,8 @@ u8 PPU_Read8(u32 addr)
 				ret = PPU.VRAMPref & 0xFF;
 				if (!(PPU.VRAMInc & 0x80))
 				{
-					PPU.VRAMPref = *(u16*)&PPU.VRAM[PPU.VRAMAddr];
+					addr = PPU_TranslateVRAMAddress(PPU.VRAMAddr);
+					PPU.VRAMPref = *(u16*)&PPU.VRAM[addr];
 					PPU.VRAMAddr += PPU.VRAMStep;
 				}
 			}
@@ -361,10 +399,17 @@ u8 PPU_Read8(u32 addr)
 				ret = PPU.VRAMPref >> 8;
 				if (PPU.VRAMInc & 0x80)
 				{
-					PPU.VRAMPref = *(u16*)&PPU.VRAM[PPU.VRAMAddr];
+					addr = PPU_TranslateVRAMAddress(PPU.VRAMAddr);
+					PPU.VRAMPref = *(u16*)&PPU.VRAM[addr];
 					PPU.VRAMAddr += PPU.VRAMStep;
 				}
 			}
+			break;
+			
+		case 0x3B:
+			ret = ((u8*)PPU.CGRAM)[PPU.CGRAMAddr];
+			PPU.CGRAMAddr++;
+			PPU.CGRAMAddr &= ~0x200; // prevent overflow
 			break;
 			
 		case 0x3C:
@@ -406,12 +451,12 @@ u8 PPU_Read8(u32 addr)
 		case 0x43: ret = SPC_IOPorts[7]; break;
 		
 		case 0x80: ret = SNES_SysRAM[Mem_WRAMAddr++]; Mem_WRAMAddr &= ~0x20000; break;
-		
-		case 0x3B: bprintf("CGRAM read\n"); break;
 
 		default:
 			if (addr >= 0x84) // B-Bus open bus
-				ret = 0x21; // high address byte
+				ret = SNES_Status->LastBusVal;
+			else if (addr >= 0x44 && addr < 0x80)
+				bprintf("!! SPC IO MIRROR READ %02X\n", addr);
 			else
 				bprintf("Open bus 21%02X\n", addr); 
 			break;
@@ -471,9 +516,9 @@ void PPU_Write8(u32 addr, u8 val)
 				PPU.OBJWidth = &PPU_OBJWidths[(val & 0xE0) >> 4];
 				PPU.OBJHeight = &PPU_OBJHeights[(val & 0xE0) >> 4];
 				
-				PPU.OBJTilesetAddr = (val & 0x03) << 14;
+				PPU.OBJTilesetAddr = (val & 0x07) << 14;
 				PPU.OBJTileset = (u16*)&PPU.VRAM[PPU.OBJTilesetAddr];
-				PPU.OBJGap = (val & 0x1C) << 9;
+				PPU.OBJGap = (val & 0x18) << 10;
 			}
 			break;
 			
@@ -507,8 +552,11 @@ void PPU_Write8(u32 addr, u8 val)
 			break;
 			
 		case 0x05:
-			PPU.Mode = val;
-			PPU.ModeDirty = 1;
+			if(PPU.Mode != val)
+			{
+				PPU.Mode = val;
+				PPU.ModeDirty = 1;
+			}
 			break;
 			
 		case 0x06: // mosaic
@@ -541,7 +589,6 @@ void PPU_Write8(u32 addr, u8 val)
 		case 0x14: PPU_SetYScroll(3, val); break;
 		
 		case 0x15:
-			if ((val & 0x0C) != 0x00) bprintf("UNSUPPORTED VRAM MODE %02X\n", val);
 			PPU.VRAMInc = val;
 			switch (val & 0x03)
 			{
@@ -555,20 +602,23 @@ void PPU_Write8(u32 addr, u8 val)
 		case 0x16:
 			PPU.VRAMAddr &= 0xFE00;
 			PPU.VRAMAddr |= (val << 1);
-			PPU.VRAMPref = *(u16*)&PPU.VRAM[PPU.VRAMAddr];
+			addr = PPU_TranslateVRAMAddress(PPU.VRAMAddr);
+			PPU.VRAMPref = *(u16*)&PPU.VRAM[addr];
 			break;
 		case 0x17:
 			PPU.VRAMAddr &= 0x01FE;
 			PPU.VRAMAddr |= ((val & 0x7F) << 9);
-			PPU.VRAMPref = *(u16*)&PPU.VRAM[PPU.VRAMAddr];
+			addr = PPU_TranslateVRAMAddress(PPU.VRAMAddr);
+			PPU.VRAMPref = *(u16*)&PPU.VRAM[addr];
 			break;
 		
 		case 0x18: // VRAM shit
 			{
-				if (PPU.VRAM[PPU.VRAMAddr] != val)
+				addr = PPU_TranslateVRAMAddress(PPU.VRAMAddr);
+				if (PPU.VRAM[addr] != val)
 				{
-					PPU.VRAM[PPU.VRAMAddr] = val;
-					PPU.VRAMUpdateCount[PPU.VRAMAddr >> 4]++;
+					PPU.VRAM[addr] = val;
+					PPU.VRAMUpdateCount[addr >> 4]++;
 				}
 				if (!(PPU.VRAMInc & 0x80))
 					PPU.VRAMAddr += PPU.VRAMStep;
@@ -576,10 +626,11 @@ void PPU_Write8(u32 addr, u8 val)
 			break;
 		case 0x19:
 			{
-				if (PPU.VRAM[PPU.VRAMAddr+1] != val)
+				addr = PPU_TranslateVRAMAddress(PPU.VRAMAddr);
+				if (PPU.VRAM[addr+1] != val)
 				{
-					PPU.VRAM[PPU.VRAMAddr+1] = val;
-					PPU.VRAMUpdateCount[PPU.VRAMAddr >> 4]++;
+					PPU.VRAM[addr+1] = val;
+					PPU.VRAMUpdateCount[addr >> 4]++;
 				}
 				if (PPU.VRAMInc & 0x80)
 					PPU.VRAMAddr += PPU.VRAMStep;
@@ -587,8 +638,11 @@ void PPU_Write8(u32 addr, u8 val)
 			break;
 			
 		case 0x1A:
-			PPU.M7Sel = val;
-			PPU.Mode7Dirty = 1;
+			if(PPU.M7Sel != val)
+			{
+				PPU.M7Sel = val;
+				PPU.Mode7Dirty = 1;
+			}
 			break;
 			
 		case 0x1B: // multiply/mode7 shiz
@@ -645,35 +699,82 @@ void PPU_Write8(u32 addr, u8 val)
 			break;
 			
 		case 0x23:
-			PPU.BG[0].WindowMask = val & 0x0F;
-			PPU.BG[1].WindowMask = val >> 4;
+			if (PPU.WinMask[0] != val)
+			{
+				PPU.WinMask[0] = val;
+				PPU.BG[0].WindowMask = val & 0x0F;
+				PPU.BG[1].WindowMask = val >> 4;
+				PPU.WindowDirty = 2;
+			}
 			break;
 		case 0x24:
-			PPU.BG[2].WindowMask = val & 0x0F;
-			PPU.BG[3].WindowMask = val >> 4;
+			if(PPU.WinMask[1] != val)
+			{
+				PPU.WinMask[1] = val;
+				PPU.BG[2].WindowMask = val & 0x0F;
+				PPU.BG[3].WindowMask = val >> 4;
+				PPU.WindowDirty = 2;
+			}
 			break;
 		case 0x25:
-			PPU.OBJWindowMask = val & 0x0F;
-			PPU.ColorMathWindowMask = val >> 4;
-			PPU.WindowDirty = 2;
+			if(PPU.WinMask[2] != val)
+			{
+				PPU.WinMask[2] = val;
+				PPU.OBJWindowMask = val & 0x0F;
+				PPU.ColorMathWindowMask = val >> 4;
+				PPU.WindowDirty = 2;
+			}
 			break;
 		
-		case 0x26: PPU.WinX[0] = val;   PPU.WindowDirty = 1; break;
-		case 0x27: PPU.WinX[1] = val+1; PPU.WindowDirty = 1; break;
-		case 0x28: PPU.WinX[2] = val;   PPU.WindowDirty = 1; break;
-		case 0x29: PPU.WinX[3] = val+1; PPU.WindowDirty = 1; break;
+		case 0x26:
+			if(PPU.WinX[0] != val)
+			{
+				PPU.WinX[0] = val;
+				PPU.WindowDirty = 1;
+			}
+			break;
+		case 0x27:
+			if(PPU.WinX[1] != val + 1)
+			{
+				PPU.WinX[1] = val + 1;
+				PPU.WindowDirty = 1;
+			}
+			break;
+		case 0x28:
+			if(PPU.WinX[2] != val)
+			{
+				PPU.WinX[2] = val;
+				PPU.WindowDirty = 1;
+			}
+			break;
+		case 0x29:
+			if(PPU.WinX[3] != val + 1)
+			{
+				PPU.WinX[3] = val + 1;
+				PPU.WindowDirty = 1;
+			}
+			break;
 		
 		case 0x2A:
-			PPU.BG[0].WindowCombine = PPU_WindowCombine[(val & 0x03)];
-			PPU.BG[1].WindowCombine = PPU_WindowCombine[(val & 0x0C) >> 2];
-			PPU.BG[2].WindowCombine = PPU_WindowCombine[(val & 0x30) >> 4];
-			PPU.BG[3].WindowCombine = PPU_WindowCombine[(val & 0xC0) >> 6];
+			if(PPU.WinCombine[0] != val)
+			{
+				PPU.WinCombine[0] = val;
+				PPU.BG[0].WindowCombine = PPU_WindowCombine[(val & 0x03)];
+				PPU.BG[1].WindowCombine = PPU_WindowCombine[(val & 0x0C) >> 2];
+				PPU.BG[2].WindowCombine = PPU_WindowCombine[(val & 0x30) >> 4];
+				PPU.BG[3].WindowCombine = PPU_WindowCombine[(val & 0xC0) >> 6];
+				PPU.WindowDirty = 2;
+			}
 			break;
 			
 		case 0x2B:
-			PPU.OBJWindowCombine = PPU_WindowCombine[(val & 0x03)];
-			PPU.ColorMathWindowCombine = PPU_WindowCombine[(val & 0x0C) >> 2];
-			PPU.WindowDirty = 2;
+			if(PPU.WinCombine[1] != val & 0xF)
+			{
+				PPU.WinCombine[1] = val & 0xF;
+				PPU.OBJWindowCombine = PPU_WindowCombine[(val & 0x03)];
+				PPU.ColorMathWindowCombine = PPU_WindowCombine[(val & 0x0C) >> 2];
+				PPU.WindowDirty = 2;
+			}
 			break;
 			
 		case 0x2C:
@@ -708,14 +809,20 @@ void PPU_Write8(u32 addr, u8 val)
 		
 		case 0x30:
 			if ((PPU.ColorMath1 ^ val) & 0x03)
+			{
 				PPU.ModeDirty = 1;
+				PPU.WindowDirty = 1;
+			}
 			PPU.ColorMath1 = val;
 			break;
 		case 0x31:
 			if ((PPU.ColorMath2 ^ val) & 0x80)
 				PPU.ColorEffectDirty = 1;
 			if ((PPU.ColorMath2 ^ val) & 0x7F)
+			{
 				PPU.ModeDirty = 1;
+				PPU.WindowDirty = 1;
+			}
 			PPU.ColorMath2 = val;
 			break;
 			
@@ -732,22 +839,23 @@ void PPU_Write8(u32 addr, u8 val)
 		case 0x33: // SETINI
 			{
 				u32 height = (val & 0x04) ? 239:224;
-				if (height != PPU.ScreenHeight)
+				if (height != SNES_Status->ScreenHeight)
 				{
-					PPU.ScreenHeight = height;
+					SNES_Status->ScreenHeight = height;
 					ApplyScaling();
 				}
+				PPU.M7ExtBG = val & 0x40;
+				PPU.OBJVDir = val & 0x02;
+				PPU.Interlace = val & 0x1;
 				if (val & 0x80) bprintf("!! PPU EXT SYNC\n");
-				if (val & 0x40) bprintf("!! MODE7 EXTBG\n");
 				if (val & 0x08) bprintf("!! PSEUDO HIRES\n");
-				if (val & 0x02) bprintf("!! SMALL SPRITES\n");
 			}
 			break;
 			
-		case 0x40: SPC_IOPorts[0] = val; break;
-		case 0x41: SPC_IOPorts[1] = val; break;
-		case 0x42: SPC_IOPorts[2] = val; break;
-		case 0x43: SPC_IOPorts[3] = val; break;
+		case 0x40: SPC_Compensate(); SPC_IOPorts[0] = val; break;
+		case 0x41: SPC_Compensate(); SPC_IOPorts[1] = val; break;
+		case 0x42: SPC_Compensate(); SPC_IOPorts[2] = val; break;
+		case 0x43: SPC_Compensate(); SPC_IOPorts[3] = val; break;
 		
 		case 0x80: SNES_SysRAM[Mem_WRAMAddr++] = val; Mem_WRAMAddr &= ~0x20000; break;
 		case 0x81: Mem_WRAMAddr = (Mem_WRAMAddr & 0x0001FF00) | val; break;
@@ -755,7 +863,7 @@ void PPU_Write8(u32 addr, u8 val)
 		case 0x83: Mem_WRAMAddr = (Mem_WRAMAddr & 0x0000FFFF) | ((val & 0x01) << 16); break;
 				
 		default:
-			//iprintf("PPU_Write8(%08X, %08X)\n", addr, val);
+			iprintf("PPU_Write8(%08X, %08X)\n", addr, val);
 			break;
 	}
 }
@@ -768,22 +876,25 @@ void PPU_Write16(u32 addr, u16 val)
 		
 		case 0x16:
 			PPU.VRAMAddr = (val << 1) & 0xFFFEFFFF;
-			PPU.VRAMPref = *(u16*)&PPU.VRAM[PPU.VRAMAddr];
+			addr = PPU_TranslateVRAMAddress(PPU.VRAMAddr);
+			PPU.VRAMPref = *(u16*)&PPU.VRAM[addr];
 			break;
 			
 		case 0x18:
-			if (*(u16*)&PPU.VRAM[PPU.VRAMAddr] != val)
+			addr = PPU_TranslateVRAMAddress(PPU.VRAMAddr);
+			if (*(u16*)&PPU.VRAM[addr] != val)
 			{
-				*(u16*)&PPU.VRAM[PPU.VRAMAddr] = val;
-				PPU.VRAMUpdateCount[PPU.VRAMAddr >> 4]++;
+				*(u16*)&PPU.VRAM[addr] = val;
+				PPU.VRAMUpdateCount[addr >> 4]++;
 			}
 			PPU.VRAMAddr += PPU.VRAMStep;
 			break;
 			
-		case 0x40: *(u16*)&SPC_IOPorts[0] = val; break;
-		case 0x41: *(u16*)&SPC_IOPorts[1] = val; break;
-		case 0x42: *(u16*)&SPC_IOPorts[2] = val; break;
+		case 0x40: SPC_Compensate(); *(u16*)&SPC_IOPorts[0] = val; break;
+		case 0x41: SPC_Compensate(); *(u16*)&SPC_IOPorts[1] = val; break;
+		case 0x42: SPC_Compensate(); *(u16*)&SPC_IOPorts[2] = val; break;
 		
+		case 0x3F:
 		case 0x43: bprintf("!! write $21%02X %04X\n", addr, val); break;
 		
 		case 0x81: Mem_WRAMAddr = (Mem_WRAMAddr & 0x00010000) | val; break;
@@ -820,14 +931,155 @@ inline void PPU_ComputeSingleWindow(PPU_WindowSegment* s, u32 x1, u32 x2, u32 ma
 	s->WindowMask = WINMASK_OUT;
 }
 
+void PPU_ComputerDoubleWindow(PPU_WindowSegment* s)
+{
+	if (PPU.WinX[0] < PPU.WinX[2])
+	{
+		// window 1 first
+		
+		// border to win1 x1
+		s->EndOffset = PPU.WinX[0];
+		s->WindowMask = WINMASK_OUT;
+		s++;
+		
+		if (PPU.WinX[2] < PPU.WinX[1])
+		{
+			// windows overlapped
+			
+			// win1 x1 to win2 x1
+			s->EndOffset = PPU.WinX[2];
+			s->WindowMask = WINMASK_1;
+			s++;
+
+			if(PPU.WinX[3] <= PPU.WinX[1])
+			{
+				// win2 fully in win1
+
+				// close win2
+				s->EndOffset = PPU.WinX[3];
+				s->WindowMask = WINMASK_12;
+				s++;
+
+				// close win1
+				s->EndOffset = PPU.WinX[1];
+				s->WindowMask = WINMASK_1;
+				s++;
+
+				// finish
+				s->EndOffset = 256;
+				s->WindowMask = WINMASK_OUT;
+				return;
+			}
+			
+			// windows intersect
+
+			// win2 x1 to win1 x2
+			s->EndOffset = PPU.WinX[1];
+			s->WindowMask = WINMASK_12;
+			s++;
+		}
+		else
+		{
+			// windows separate
+				
+			// win1 x1 to win1 x2
+			s->EndOffset = PPU.WinX[1];
+			s->WindowMask = WINMASK_1;
+			s++;
+				
+			// win1 x2 to win2 x1
+			s->EndOffset = PPU.WinX[2];
+			s->WindowMask = WINMASK_OUT;
+			s++;
+		}
+			
+		// to win2 x2
+		s->EndOffset = PPU.WinX[3];
+		s->WindowMask = WINMASK_2;
+		s++;
+			
+		// win2 x2 to border
+		s->EndOffset = 256;
+		s->WindowMask = WINMASK_OUT;
+	}
+	else
+	{
+		// window 2 first
+		
+		// border to win2 x1
+		s->EndOffset = PPU.WinX[2];
+		s->WindowMask = WINMASK_OUT;
+		s++;
+			
+		if (PPU.WinX[0] < PPU.WinX[3])
+		{
+			// windows overlapped
+			
+			// win2 x1 to win1 x1
+			s->EndOffset = PPU.WinX[0];
+			s->WindowMask = WINMASK_2;
+			s++;
+
+			if(PPU.WinX[1] <= PPU.WinX[3])
+			{
+				// win1 fully in win2
+				
+				// close win1
+				s->EndOffset = PPU.WinX[1];
+				s->WindowMask = WINMASK_12;
+				s++;
+
+				// close win2
+				s->EndOffset = PPU.WinX[3];
+				s->WindowMask = WINMASK_2;
+				s++;
+
+				// finish
+				s->EndOffset = 256;
+				s->WindowMask = WINMASK_OUT;
+				return;
+			}
+
+			// win1 x1 to win2 x2
+			s->EndOffset = PPU.WinX[3];
+			s->WindowMask = WINMASK_12;
+			s++;
+		}
+		else
+		{
+			// windows separate
+				
+			// win2 x1 to win2 x2
+			s->EndOffset = PPU.WinX[3];
+			s->WindowMask = WINMASK_2;
+			s++;
+				
+			// win2 x2 to win1 x1
+			s->EndOffset = PPU.WinX[0];
+			s->WindowMask = WINMASK_OUT;
+			s++;
+		}
+			
+		// to win1 x2
+		s->EndOffset = PPU.WinX[1];
+		s->WindowMask = WINMASK_1;
+		s++;
+			
+		// win1 x2 to border
+		s->EndOffset = 256;
+		s->WindowMask = WINMASK_OUT;
+	}
+}
+
 void PPU_ComputeWindows(PPU_WindowSegment* s)
 {
 	PPU_WindowSegment* first_s = s;
-	
+	//bprintf("-0- (%d,%d), -1- (%d,%d)\n", PPU.WinX[0], PPU.WinX[1], PPU.WinX[2], PPU.WinX[3]);
 	// check for cases that would disable windows fully
 	if ((!((PPU.MainScreen|PPU.SubScreen) & 0x1F00)) && 
 		(((PPU.ColorMath1 & 0x30) == 0x00) || ((PPU.ColorMath1 & 0x30) == 0x30)))
 	{
+		//bprintf("Disabled\n");
 		s->EndOffset = 256;
 		s->WindowMask = 0x0F;
 		s->ColorMath = 0x10;
@@ -847,101 +1099,7 @@ void PPU_ComputeWindows(PPU_WindowSegment* s)
 	else
 	{
 		// okay, we have two windows
-
-		if (PPU.WinX[0] < PPU.WinX[2])
-		{
-			// window 1 first
-			
-			// border to win1 x1
-			s->EndOffset = PPU.WinX[0];
-			s->WindowMask = WINMASK_OUT;
-			s++;
-			
-			if (PPU.WinX[2] < PPU.WinX[1])
-			{
-				// windows overlapped
-				
-				// win1 x1 to win2 x1
-				s->EndOffset = PPU.WinX[2];
-				s->WindowMask = WINMASK_1;
-				s++;
-				
-				// win2 x1 to win1 x2
-				s->EndOffset = PPU.WinX[1];
-				s->WindowMask = WINMASK_12;
-				s++;
-			}
-			else
-			{
-				// windows separate
-				
-				// win1 x1 to win1 x2
-				s->EndOffset = PPU.WinX[1];
-				s->WindowMask = WINMASK_1;
-				s++;
-				
-				// win1 x2 to win2 x1
-				s->EndOffset = PPU.WinX[2];
-				s->WindowMask = WINMASK_OUT;
-				s++;
-			}
-			
-			// to win2 x2
-			s->EndOffset = PPU.WinX[3];
-			s->WindowMask = WINMASK_2;
-			s++;
-			
-			// win2 x2 to border
-			s->EndOffset = 256;
-			s->WindowMask = WINMASK_OUT;
-		}
-		else
-		{
-			// window 2 first
-			
-			// border to win2 x1
-			s->EndOffset = PPU.WinX[2];
-			s->WindowMask = WINMASK_OUT;
-			s++;
-			
-			if (PPU.WinX[0] < PPU.WinX[3])
-			{
-				// windows overlapped
-				
-				// win2 x1 to win1 x1
-				s->EndOffset = PPU.WinX[0];
-				s->WindowMask = WINMASK_2;
-				s++;
-				
-				// win1 x1 to win2 x2
-				s->EndOffset = PPU.WinX[3];
-				s->WindowMask = WINMASK_12;
-				s++;
-			}
-			else
-			{
-				// windows separate
-				
-				// win2 x1 to win2 x2
-				s->EndOffset = PPU.WinX[3];
-				s->WindowMask = WINMASK_2;
-				s++;
-				
-				// win2 x2 to win1 x1
-				s->EndOffset = PPU.WinX[0];
-				s->WindowMask = WINMASK_OUT;
-				s++;
-			}
-			
-			// to win1 x2
-			s->EndOffset = PPU.WinX[1];
-			s->WindowMask = WINMASK_1;
-			s++;
-			
-			// win1 x2 to border
-			s->EndOffset = 256;
-			s->WindowMask = WINMASK_OUT;
-		}
+		PPU_ComputerDoubleWindow(s);
 	}
 	
 	// precompute the final window for color math

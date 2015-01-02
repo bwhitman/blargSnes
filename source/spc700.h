@@ -19,10 +19,24 @@
 #ifndef _SPC700_H_
 #define _SPC700_H_
 
+typedef union
+{
+	u32 Val;
+	struct
+	{
+		u16 LowPart;
+		u16 HighPart;
+	};
+	
+} SPC_Timer;
+
 extern u8 SPC_RAM[0x10040];
 
 extern u32 SPC_ElapsedCycles;
-extern u32 SPC_CyclesRemaining;
+
+extern u8 SPC_TimerEnable;
+extern u32 SPC_TimerReload[3];
+extern SPC_Timer SPC_TimerVal[3];
 
 typedef struct
 {
@@ -40,11 +54,9 @@ extern SPC_Regs_t SPC_Regs;
 
 extern u8 SPC_ROM[0x40];
 
-extern struct SPC_TimersStruct SPC_Timers;
-
 	
 void SPC_Reset();
-void SPC_Run(u32 cycles);
+void SPC_Run(int cycles);
 
 void SPC_InitMisc();
 

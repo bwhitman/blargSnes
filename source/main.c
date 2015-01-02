@@ -98,7 +98,10 @@ int exitspc = 0;
 void SPCThread(u32 blarg)
 {
 	int i;
-	
+			/*u64 lastmixtime = svcGetSystemTick();
+			u32 mixtimes[2048];
+			memset(mixtimes, 0, 2048*4);
+			int k = 0;*/
 	while (!exitspc)
 	{
 		svcWaitSynchronization(SPCSync, U64_MAX);
@@ -113,6 +116,27 @@ void SPCThread(u32 blarg)
 			}
 			
 			Audio_MixFinish();
+			/*if (k < 2048)
+			{
+				u64 t = svcGetSystemTick();
+				u32 diff = (u32)(t-lastmixtime);
+				lastmixtime = t;
+				mixtimes[k] = diff;
+				k++;
+				if (k >= 2048)
+				{
+					double avg = 0;
+					int m;
+					for (m = 0; m < 2048; m++) avg += (double)mixtimes[m];
+					avg /= 2048.0f;
+					avg = (avg * 1000.0f) / 268123480.0f;
+					// avg = time in ms for 512 samples
+					double freq = (1000.0f * 512.0f) / avg;
+					bprintf("time: %f | freq: %f\n", avg, freq);
+					
+					k = 0;
+				}
+			}*/
 		}
 		else
 			Audio_Pause();
@@ -156,11 +180,13 @@ void SPC_ReportUnk(u8 op, u32 pc)
 void ReportCrash()
 {
 	pause = 1;
+	running = 0;
 	
 	ClearConsole();
 	bprintf("Game has crashed (STOP)\n");
 	
-	bprintf("PC: %02X|%04X\n", CPU_Regs.PBR, CPU_Regs.PC);
+	extern u32 debugpc;
+	bprintf("PC: %02X:%04X (%06X)\n", CPU_Regs.PBR, CPU_Regs.PC, debugpc);
 	bprintf("P: %02X | M=%d X=%d E=%d\n", CPU_Regs.P.val&0xFF, CPU_Regs.P.M, CPU_Regs.P.X, CPU_Regs.P.E);
 	bprintf("A: %04X X: %04X Y: %04X\n", CPU_Regs.A, CPU_Regs.X, CPU_Regs.Y);
 	bprintf("S: %04X D: %02X DBR: %02X\n", CPU_Regs.S, CPU_Regs.D, CPU_Regs.DBR);
@@ -230,21 +256,11 @@ float vertexList[] =
 {
 	// border
 	0.0, 0.0, 0.9,      0.78125, 0.0625,
-	240.0, 0.0, 0.9,    0.78125, 1.0,
 	240.0, 400.0, 0.9,  0.0, 1.0,
-	
-	0.0, 0.0, 0.9,      0.78125, 0.0625,
-	240.0, 400.0, 0.9,  0.0, 1.0,
-	0.0, 400.0, 0.9,    0.0, 0.0625,
 	
 	// screen
-	8.0, 72.0, 0.9,      1.0, 0.875,
-	232.0, 72.0, 0.9,    1.0, 0.0,
-	232.0, 328.0, 0.9,  0.0, 0.0,
-	
-	8.0, 72.0, 0.9,      1.0, 0.875,
-	232.0, 328.0, 0.9,  0.0, 0.0,
-	8.0, 328.0, 0.9,    0.0, 0.875,
+	8.0, 72.0, 0.9,     1.0, 0.87890625,
+	232.0, 328.0, 0.9,  0.0, 0.00390625,
 };
 float* borderVertices;
 float* screenVertices;
@@ -252,12 +268,13 @@ float* screenVertices;
 
 void ApplyScaling()
 {
-	float texy = (float)PPU.ScreenHeight / 256.0f;
+	float texy = (float)(SNES_Status->ScreenHeight+1) / 256.0f;
 	
 	float x1, x2, y1, y2;
 	
 	int scalemode = Config.ScaleMode;
 	if (!running && scalemode == 2) scalemode = 1;
+	else if (!running && scalemode == 4) scalemode = 3;
 	
 	switch (scalemode)
 	{
@@ -266,17 +283,31 @@ void ApplyScaling()
 			y1 = 0.0f; y2 = 400.0f;
 			break;
 			
-		case 2: // overscan
+		case 2: // cropped
 			{
-				float bigy = ((float)PPU.ScreenHeight * 240.0f) / (float)(PPU.ScreenHeight-16);
+				float bigy = ((float)SNES_Status->ScreenHeight * 240.0f) / (float)(SNES_Status->ScreenHeight-16);
 				float margin = (bigy - 240.0f) / 2.0f;
 				x1 = -margin; x2 = 240.0f+margin;
 				y1 = 0.0f; y2 = 400.0f;
 			}
 			break;
 			
+		case 3: // 4:3
+			x1 = 0.0f; x2 = 240.0f;
+			y1 = 40.0f; y2 = 360.0f;
+			break;
+			
+		case 4: // cropped 4:3
+			{
+				float bigy = ((float)SNES_Status->ScreenHeight * 240.0f) / (float)(SNES_Status->ScreenHeight-16);
+				float margin = (bigy - 240.0f) / 2.0f;
+				x1 = -margin; x2 = 240.0f+margin;
+				y1 = 29.0f; y2 = 371.0f;
+			}
+			break;
+			
 		default: // 1:1
-			if (PPU.ScreenHeight == 239)
+			if (SNES_Status->ScreenHeight == 239)
 			{
 				x1 = 1.0f; x2 = 240.0f;
 			}
@@ -289,13 +320,9 @@ void ApplyScaling()
 	}
 	
 	screenVertices[5*0 + 0] = x1; screenVertices[5*0 + 1] = y1; screenVertices[5*0 + 4] = texy; 
-	screenVertices[5*1 + 0] = x2; screenVertices[5*1 + 1] = y1; 
-	screenVertices[5*2 + 0] = x2; screenVertices[5*2 + 1] = y2; 
-	screenVertices[5*3 + 0] = x1; screenVertices[5*3 + 1] = y1; screenVertices[5*3 + 4] = texy; 
-	screenVertices[5*4 + 0] = x2; screenVertices[5*4 + 1] = y2; 
-	screenVertices[5*5 + 0] = x1; screenVertices[5*5 + 1] = y2; screenVertices[5*5 + 4] = texy; 
+	screenVertices[5*1 + 0] = x2; screenVertices[5*1 + 1] = y2; 
 	
-	GSPGPU_FlushDataCache(NULL, (u32*)screenVertices, 5*6*sizeof(float));
+	GSPGPU_FlushDataCache(NULL, (u32*)screenVertices, 5*2*sizeof(float));
 }
 
 
@@ -329,6 +356,7 @@ void SafeWait(Handle evt)
 
 void RenderTopScreen()
 {
+	bglGeometryShaderParams(4, 0x3);
 	bglUseShader(finalShader);
 	
 	bglOutputBuffers(gpuOut, gpuDOut);
@@ -354,23 +382,23 @@ void RenderTopScreen()
 	
 	bglTexImage(GPU_TEXUNIT0, BorderTex,512,256,0,GPU_RGBA8);
 	
-	bglUniformMatrix(0x20, screenProjMatrix);
+	bglUniformMatrix(0, screenProjMatrix);
 	
 	bglNumAttribs(2);
 	bglAttribType(0, GPU_FLOAT, 3);	// vertex
 	bglAttribType(1, GPU_FLOAT, 2);	// texcoord
 	bglAttribBuffer(borderVertices);
 	
-	bglDrawArrays(GPU_TRIANGLES, 2*3); // border
-	
+	bglDrawArrays(GPU_UNKPRIM, 2); // border
+
 	// filtering enabled only when scaling
 	// filtering at 1:1 causes output to not be pixel-perfect, but not filtering at higher res looks like total shit
 	bglTexImage(GPU_TEXUNIT0, SNESFrame,256,256, Config.ScaleMode?0x6:0 ,GPU_RGBA8);
 	
 	bglAttribBuffer(screenVertices);
 	
-	bglDrawArrays(GPU_TRIANGLES, 2*3); // screen
-	
+	bglDrawArrays(GPU_UNKPRIM, 2); // screen
+
 	if (!RenderState)
 	{
 		bglFlush();
@@ -721,15 +749,30 @@ bool StartROM(char* path)
 
 
 
-int reported=0;
+int reported=0;extern u32 debugpc;
+u32 oldshiz=0;
 void reportshit(u32 pc, u32 a, u32 y)
 {
-	/*if (reported) return;
-	reported = 1;
-	bprintf("-- %06X\n", pc);
-	bprintf("--- %04X %04X\n", *(u16*)&SNES_SysRAM[0x1E5A], *(u16*)&SNES_SysRAM[0x1E5E]);
-	bprintf("--- %04X %04X\n", *(u16*)&SNES_SysRAM[0x6], *(u16*)&SNES_SysRAM[0xA]);
-	dbg_save("/snesram_earthbound.bin", SNES_SysRAM, 128*1024);*/
+	/*if (*(u32*)&SNES_SysRAM[0x300] != 0xEFEFEFEF && oldshiz==0xEFEFEFEF)
+	{
+		if (reported) return; reported=1;
+		bprintf("%06X A=%04X %04X\n", pc, a, *(u32*)&SNES_SysRAM[0x300]);
+	}
+	oldshiz = *(u32*)&SNES_SysRAM[0x300];*/
+	//bprintf("!! IRQ %04X %02X\n", SNES_Status->IRQ_CurHMatch, SNES_Status->IRQCond);
+	//pause=1;
+	//bprintf("TSX S=%04X X=%04X P=%04X  %04X\n", pc>>16, a, y&0xFFFF, y>>16);
+	bprintf("%06X\n", debugpc);
+	running=0; pause=1;
+}
+
+int reported2=0;
+void reportshit2(u32 pc, u32 a, u32 y)
+{
+	//bprintf("TSC S=%04X A=%04X P=%04X  %04X\n", pc>>16, a, y&0xFFFF, y>>16);
+	if (SNES_SysRAM[0x3C8] == 0 && reported2 != 0)
+		bprintf("[%06X] 3C8=0\n", debugpc);
+	reported2 = SNES_SysRAM[0x3C8];
 }
 
 
@@ -768,6 +811,7 @@ int main()
 	LoadConfig();
 	
 	VRAM_Init();
+	SNES_Init();
 	PPU_Init();
 	
 	GPU_Init(NULL);
@@ -799,12 +843,12 @@ int main()
 	BorderTex = (u32*)linearAlloc(512*256*4);
 	
 	// copy some fixed vertices to linear memory
-	borderVertices = (float*)linearAlloc(5*3 * 2 * sizeof(float));
-	screenVertices = (float*)linearAlloc(5*3 * 2 * sizeof(float));
+	borderVertices = (float*)linearAlloc(5*2 * sizeof(float));
+	screenVertices = (float*)linearAlloc(5*2 * sizeof(float));
 	
 	float* fptr = &vertexList[0];
-	for (i = 0; i < 5*3*2; i++) borderVertices[i] = *fptr++;
-	for (i = 0; i < 5*3*2; i++) screenVertices[i] = *fptr++;
+	for (i = 0; i < 5*2; i++) borderVertices[i] = *fptr++;
+	for (i = 0; i < 5*2; i++) screenVertices[i] = *fptr++;
 	ApplyScaling();
 	
 	
@@ -839,8 +883,17 @@ int main()
 			if (running && !pause)
 			{
 				// emulate
-				CPU_Run(); // runs the SNES for one frame. Handles PPU rendering.
+				CPU_MainLoop(); // runs the SNES for one frame. Handles PPU rendering.
 				ContinueRendering();
+				
+				/*{
+					extern u32 dbgcycles, nruns;
+					bprintf("SPC: %d / 17066  %08X\n", dbgcycles, SNES_Status->SPC_CycleRatio);
+					dbgcycles = 0; nruns=0;
+				}*/
+				/*if (press & KEY_X) SNES_Status->SPC_CycleRatio+=0x1000;
+				if (press & KEY_Y) SNES_Status->SPC_CycleRatio-=0x1000;
+				SNES_Status->SPC_CyclesPerLine = SNES_Status->SPC_CycleRatio*1364;*/
 				
 				// SRAM autosave check
 				// TODO: also save SRAM under certain circumstances (pausing, returning to home menu, etc)
@@ -878,7 +931,7 @@ int main()
 						
 						// copy splashscreen
 						FinishRendering();
-						PPU.ScreenHeight = 224;
+						SNES_Status->ScreenHeight = 224;
 						ApplyScaling();
 						u32* tempbuf = (u32*)linearAlloc(256*256*4);
 						CopyBitmapToTexture(screenfill, tempbuf, 256, 224, 0xFF, 0, 32, 0x0);
@@ -894,8 +947,12 @@ int main()
 					}
 					else if (release & KEY_X)
 					{
-						bprintf("PC: %02X|%04X\n", CPU_Regs.PBR, CPU_Regs.PC);
+						bprintf("PC: CPU %02X:%04X  SPC %04X\n", CPU_Regs.PBR, CPU_Regs.PC, SPC_Regs.PC);
 						dbg_save("/snesram.bin", SNES_SysRAM, 128*1024);
+						dbg_save("/spcram.bin", SPC_RAM, 64*1024);
+						dbg_save("/vram.bin", PPU.VRAM, 64*1024);
+						dbg_save("/oam.bin", PPU.OAM, 0x220);
+						dbg_save("/cgram.bin", PPU.CGRAM, 512);
 					}
 					
 					if ((held & (KEY_L|KEY_R)) == (KEY_L|KEY_R))

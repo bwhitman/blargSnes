@@ -34,15 +34,32 @@
 SPC_Regs:
 	.long 0,0,0,0,0,0,0,0
 	
-.global SPC_CyclesRemaining
+.global dbgcycles
+dbgcycles:
+	.long 0
+.global nruns
+nruns:
+	.long 0
+	
+.global SPC_TimerReload
+.global SPC_TimerVal
+.global SPC_TimerEnable
 .global SPC_ElapsedCycles
 	
 .global SPC_RAM
 .global SPC_ROM
 
-SPC_CyclesRemaining: @ -8
-	.long 0
-SPC_ElapsedCycles: @ -4
+@ r0-r4, r12, lr
+@SPC_ResumeInfo:		@ -60
+@	.long 0,0,0,0,0,0,0
+SPC_TimerReload:	@ -32
+	.long 0,0,0
+SPC_TimerVal: 		@ -20
+	.long 0,0,0
+SPC_TimerEnable: 	@ -8
+	.byte 0
+	.byte 0,0,0
+SPC_ElapsedCycles: 	@ -4
 	.long 0
 SPC_RAM:
 	.rept 0x10040
@@ -89,101 +106,132 @@ SPC_UpdateMemMap:
 	ldmia sp!, {r0-r8}
 	bx lr
 	
+.macro SPCPause
+	add r4, pc, #12
+	sub memory, memory, #60
+	orr spcPSW, spcPSW, #flagPause
+	stmia memory, {r0-r4, r12, lr}
+	b spcpause
+.endm
+
+.macro SPCResume
+	tst spcPSW, #flagPause
+	beq 1f
+	ldmia memory, {r0-r4, r12, lr}
+	bic spcPSW, spcPSW, #flagPause
+	add memory, memory, #60
+	blx r4
+1:
+.endm
+	
 @ --- General purpose read/write ----------------------------------------------
 
-.macro MemRead8 addr=r0
-	bic r3, \addr, #0x000F
+_MemRead8:
+	bic r3, r0, #0x000F
 	cmp r3, #0x00F0
-	ldrneb r0, [memory, \addr]
-	bne 1f
-	@ speedhack: when reading timer values, eat cycles
-	cmp \addr, #0xFD
-	orrge spcPSW, spcPSW, #flagT1
-2:
+	ldrneb r0, [memory, r0]
+	bxne lr
+	stmdb sp!, {r1-r3, r12, lr}
+	bl SPC_IORead8
+	ldmia sp!, {r1-r3, r12, pc}
+
+_MemRead16:
+	bic r3, r0, #0x000F
+	cmp r3, #0x00F0
+	addne r3, memory, r0
+	ldrneh r0, [r3]
+	bxne lr
+	stmdb sp!, {r1-r3, r12, lr}
+	bl SPC_IORead16
+	ldmia sp!, {r1-r3, r12, pc}
+
+_MemWrite8:
+	bic r3, r0, #0x000F
+	cmp r3, #0x00F0
+	beq w8_io
+	add r3, r0, #0x40
+	cmp r3, #0x10000
+	andge r3, spcPSW, #flagR
+	addge r0, r0, r3, lsr #2
+	strb r1, [memory, r0]
+	bx lr
+w8_io:
+	@and r3, r0, #0xFC
+	@cmp r3, #0xF4
+	@bne w8_nopause
+	@SPCPause
+w8_nopause:
+	stmdb sp!, {r1-r3, r12, lr}
+	cmp r0, #0xF1
+	moveq r3, r1
+	bleq SPC_UpdateMemMap
+	bl SPC_IOWrite8
+	ldmia sp!, {r1-r3, r12, pc}
+
+_MemWrite16:
+	bic r3, r0, #0x000F
+	cmp r3, #0x00F0
+	beq w16_io
+	add r3, r0, #0x40
+	cmp r3, #0x10000
+	andge r3, spcPSW, #flagR
+	addge r0, r0, r3, lsr #2
+	add r3, memory, r0
+	strh r1, [r3]
+	bx lr
+w16_io:
+	@and r3, r0, #0xFC
+	@cmp r3, #0xF4
+	@bne w16_nopause
+	@SPCPause
+w16_nopause:
+	stmdb sp!, {r1-r3, r12, lr}
+	cmp r0, #0xF0
+	bne w16_notF0
+	mov r3, r1, lsr #0x8
+	bl SPC_UpdateMemMap
+	b w16_F0_done
+w16_notF0:
+	cmp r0, #0xF1
+	moveq r3, r1
+	bleq SPC_UpdateMemMap
+w16_F0_done:
+	bl SPC_IOWrite16
+	ldmia sp!, {r1-r3, r12, pc}
+
+
+.macro MemRead8 addr=r0
 	.ifnc \addr, r0
 		mov r0, \addr
 	.endif
-	stmdb sp!, {r1-r3, r12}
-	bl SPC_IORead8
-	ldmia sp!, {r1-r3, r12}
-1:
+	bl _MemRead8
 .endm
 
 .macro MemRead16 addr=r0
-	bic r3, \addr, #0x000F
-	cmp r3, #0x00F0
-	beq 1f
-	add r3, memory, \addr
-	ldrh r0, [r3]
-	b 2f
-1:
 	.ifnc \addr, r0
 		mov r0, \addr
 	.endif
-	stmdb sp!, {r1-r3, r12}
-	bl SPC_IORead16
-	ldmia sp!, {r1-r3, r12}
-2:
+	bl _MemRead16
 .endm
 
 .macro MemWrite8 addr=r0, val=r1
-	bic r3, \addr, #0x000F
-	cmp r3, #0x00F0
-	beq 1f
-	add r3, \addr, #0x40
-	cmp r3, #0x10000
-	andge r3, spcPSW, #flagR
-	addge \addr, \addr, r3, lsr #2
-	strb \val, [memory, \addr]
-	b 2f
-1:
 	.ifnc \addr, r0
 		mov r0, \addr
 	.endif
 	.ifnc \val, r1
 		mov r1, \val
 	.endif
-	cmp r0, #0xF1
-	moveq r3, r1
-	bleq SPC_UpdateMemMap
-	stmdb sp!, {r1-r3, r12}
-	bl SPC_IOWrite8
-	ldmia sp!, {r1-r3, r12}
-2:
+	bl _MemWrite8
 .endm
 
 .macro MemWrite16 addr=r0, val=r1
-	bic r3, \addr, #0x000F
-	cmp r3, #0x00F0
-	beq 1f
-	add r3, \addr, #0x40
-	cmp r3, #0x10000
-	andge r3, spcPSW, #flagR
-	addge \addr, \addr, r3, lsr #2
-	add r3, memory, \addr
-	strh \val, [r3]
-	b 2f
-1:
 	.ifnc \addr, r0
 		mov r0, \addr
 	.endif
 	.ifnc \val, r1
 		mov r1, \val
 	.endif
-	cmp r0, #0xF0
-	bne 4f
-	mov r3, r1, lsr #0x8
-	bl SPC_UpdateMemMap
-	b 3f
-4:
-	cmp r0, #0xF1
-	moveq r3, r1
-	bleq SPC_UpdateMemMap
-3:
-	stmdb sp!, {r1-r3, r12}
-	bl SPC_IOWrite16
-	ldmia sp!, {r1-r3, r12}
-2:
+	bl _MemWrite16
 .endm
 
 @ --- Stack read/write --------------------------------------------------------
@@ -289,51 +337,43 @@ SPC_Reset:
 	mov spcCycles, #0
 	StoreRegs
 	
-	ldr r0, =SPC_CyclesRemaining
-	mov r1, #0
-	str r1, [r0]
-	
 	ldmia sp!, {r3-r11, lr}
 	bx lr
 	
 @ --- Main loop ---------------------------------------------------------------
-	
+
 @ r0 = number of cycles to run
 SPC_Run:
-	stmdb sp!, {r4-r12, lr}
+	stmdb sp!, {r3-r12, lr}
 	LoadRegs
 	
-	ldr r3, [memory, #-8]
-	add r3, r3, r0
-	str r3, [memory, #-8]
+	add spcCycles, r0
+	
+	@SPCResume
+			
+spcloop:
 		
-bigemuloop:
-		add spcCycles, spcCycles, #0x40
-		mov r4, spcCycles
-			
-emuloop:
-			
-			Prefetch8
-			ldr pc, [pc, r0, lsl #0x2]
-			nop
+		Prefetch8
+		ldr pc, [pc, r0, lsl #0x2]
+		nop
 	.long OP_NOP, OP_TCALL_0, OP_SET0, OP_BBS_0, OP_OR_A_DP, OP_OR_A_lm, OP_OR_A_mX, OP_OR_A_m_Y	@0
-	.long OP_OR_A_Imm, OP_OR_DP_DP, OP_UNK, OP_ASL_DP, OP_ASL_Imm, OP_PUSH_P, OP_TSET, OP_BRK
+	.long OP_OR_A_Imm, OP_OR_DP_DP, OP_OR1_C_ab, OP_ASL_DP, OP_ASL_Imm, OP_PUSH_P, OP_TSET, OP_BRK
 	.long OP_BPL, OP_TCALL_1, OP_CLR0, OP_BBC_0, OP_OR_A_DP_X, OP_OR_A_lm_X, OP_OR_A_lm_Y, OP_OR_A_m_X	@1
 	.long OP_OR_DP_Imm, OP_OR_mX_mY, OP_DECW_DP, OP_ASL_DP_X, OP_ASL_A, OP_DEC_X, OP_CMP_X_mImm, OP_JMP_a_X
 	.long OP_CLRP, OP_TCALL_2, OP_SET1, OP_BBS_1, OP_AND_A_DP, OP_AND_A_lm, OP_AND_A_mX, OP_AND_A_m_X	@2
-	.long OP_AND_A_Imm, OP_AND_DP_DP, OP_UNK, OP_ROL_DP, OP_ROL_lm, OP_PUSH_A, OP_CBNE_DP, OP_BRA
+	.long OP_AND_A_Imm, OP_AND_DP_DP, OP_OR1_C_notab, OP_ROL_DP, OP_ROL_lm, OP_PUSH_A, OP_CBNE_DP, OP_BRA
 	.long OP_BMI, OP_TCALL_3, OP_CLR1, OP_BBC_1, OP_AND_A_DP_X, OP_AND_A_lm_X, OP_AND_A_lm_Y, OP_AND_A_m_Y	@3
 	.long OP_AND_DP_Imm, OP_AND_mX_mY, OP_INCW_DP, OP_ROL_DP_X, OP_ROL_A, OP_INC_X, OP_CMP_X_DP, OP_CALL
 	.long OP_SETP, OP_TCALL_4, OP_SET2, OP_BBS_2, OP_EOR_A_DP, OP_EOR_A_lm, OP_EOR_A_mX, OP_EOR_A_m_X	@4
-	.long OP_EOR_A_Imm, OP_EOR_DP_DP, OP_UNK, OP_LSR_DP, OP_LSR_lm, OP_PUSH_X, OP_TCLR, OP_PCALL
+	.long OP_EOR_A_Imm, OP_EOR_DP_DP, OP_AND1_C_ab, OP_LSR_DP, OP_LSR_lm, OP_PUSH_X, OP_TCLR, OP_PCALL
 	.long OP_BVC, OP_TCALL_5, OP_CLR2, OP_BBC_2, OP_EOR_A_DP_X, OP_EOR_A_lm_X, OP_EOR_A_lm_Y, OP_EOR_A_m_Y	@5
 	.long OP_EOR_DP_Imm, OP_EOR_mX_mY, OP_CMPW_YA_DP, OP_LSR_DP_X, OP_LSR_A, OP_MOV_X_A, OP_CMP_Y_mImm, OP_JMP_a
-	.long OP_CLRC, OP_TCALL_6, OP_SET3, OP_BBS_3, OP_CMP_A_DP, OP_CMP_A_mImm, OP_UNK, OP_CMP_A_m_X	@6
-	.long OP_CMP_A_Imm, OP_CMP_DP_DP, OP_UNK, OP_ROR_DP, OP_ROR_lm, OP_PUSH_Y, OP_DBNZ_DP, OP_RET
+	.long OP_CLRC, OP_TCALL_6, OP_SET3, OP_BBS_3, OP_CMP_A_DP, OP_CMP_A_mImm, OP_CMP_A_mX, OP_CMP_A_m_X	@6
+	.long OP_CMP_A_Imm, OP_CMP_DP_DP, OP_AND1_C_notab, OP_ROR_DP, OP_ROR_lm, OP_PUSH_Y, OP_DBNZ_DP, OP_RET
 	.long OP_BVS, OP_TCALL_7, OP_CLR3, OP_BBC_3, OP_CMP_A_DP_X, OP_CMP_A_mImm_X, OP_CMP_A_mImm_Y, OP_CMP_A_m_Y	@7
 	.long OP_CMP_DP_Imm, OP_CMP_mX_mY, OP_ADDW_YA_DP, OP_ROR_DP_X, OP_ROR_A, OP_MOV_A_X, OP_CMP_Y_DP, OP_RET1
 	.long OP_SETC, OP_TCALL_8, OP_SET4, OP_BBS_4, OP_ADC_A_DP, OP_ADC_A_lm, OP_ADC_A_mX, OP_ADC_A_m_X	@8
-	.long OP_ADC_A_Imm, OP_ADC_DP_DP, OP_UNK, OP_DEC_DP, OP_DEC_lm, OP_MOV_Y_Imm, OP_POP_P, OP_MOV_DP_Imm
+	.long OP_ADC_A_Imm, OP_ADC_DP_DP, OP_EOR1_C_ab, OP_DEC_DP, OP_DEC_lm, OP_MOV_Y_Imm, OP_POP_P, OP_MOV_DP_Imm
 	.long OP_BCC, OP_TCALL_9, OP_CLR4, OP_BBC_4, OP_ADC_A_DP_X, OP_ADC_A_lm_X, OP_ADC_A_lm_Y, OP_ADC_A_m_Y	@9
 	.long OP_ADC_DP_Imm, OP_ADC_mX_mY, OP_SUBW_YA_DP, OP_DEC_DP_X, OP_DEC_A, OP_MOV_X_SP, OP_DIV_YA, OP_XCN_A
 	.long OP_EI, OP_TCALL_A, OP_SET5, OP_BBS_5, OP_SBC_A_DP, OP_SBC_A_lm, OP_SBC_A_mX, OP_SBC_A_m_X	@A
@@ -341,91 +381,68 @@ emuloop:
 	.long OP_BCS, OP_TCALL_B, OP_CLR5, OP_BBC_5, OP_SBC_A_DP_X, OP_SBC_A_lm_X, OP_SBC_A_lm_Y, OP_SBC_A_m_Y	@B
 	.long OP_SBC_DP_Imm, OP_SBC_mX_mY, OP_MOVW_YA_DP, OP_INC_DP_X, OP_INC_A, OP_MOV_SP_X, OP_UNK, OP_MOV_A_mX_Inc
 	.long OP_DI, OP_TCALL_C, OP_SET6, OP_BBS_6, OP_MOV_DP_A, OP_MOV_Imm_A, OP_MOV_mX_A, OP_MOV_m_X_A	@C
-	.long OP_CMP_X_Imm, OP_MOV_Imm_X, OP_UNK, OP_MOV_DP_Y, OP_MOV_Imm_Y, OP_MOV_X_Imm, OP_POP_X, OP_MUL_YA
+	.long OP_CMP_X_Imm, OP_MOV_Imm_X, OP_MOV1_ab_C, OP_MOV_DP_Y, OP_MOV_Imm_Y, OP_MOV_X_Imm, OP_POP_X, OP_MUL_YA
 	.long OP_BNE, OP_TCALL_D, OP_CLR6, OP_BBC_6, OP_MOV_DP_X_A, OP_MOV_lmX_A, OP_MOV_lmY_A, OP_MOV_m_Y_A	@D
 	.long OP_MOV_DP_X, OP_MOV_DP_Y_X, OP_MOVW_DP_YA, OP_MOV_DP_X_Y, OP_DEC_Y, OP_MOV_A_Y, OP_CBNE_DP_X, OP_UNK
 	.long OP_CLRV, OP_TCALL_E, OP_SET7, OP_BBS_7, OP_MOV_A_DP, OP_MOV_A_lm, OP_MOV_A_mX, OP_MOV_A_m_X	@E
-	.long OP_MOV_A_Imm, OP_MOV_X_lm, OP_UNK, OP_MOV_Y_DP, OP_MOV_Y_lm, OP_NOTC, OP_POP_Y, OP_UNK
+	.long OP_MOV_A_Imm, OP_MOV_X_lm, OP_NOT1_ab, OP_MOV_Y_DP, OP_MOV_Y_lm, OP_NOTC, OP_POP_Y, OP_UNK
 	.long OP_BEQ, OP_TCALL_F, OP_CLR7, OP_BBC_7, OP_MOV_A_DP_X, OP_MOV_A_lmX, OP_MOV_A_lmY, OP_MOV_A_m_Y	@F
 	.long OP_MOV_X_DP, OP_MOV_X_DP_Y, OP_MOV_DP_DP, OP_MOV_Y_DP_X, OP_INC_Y, OP_MOV_Y_A, OP_DBNZ_Y, OP_UNK
 	
 op_return:
+		@ r3 = cycles taken by the instruction
 
-			tst spcPSW, #flagT1
-			movne r3, spcCycles
-			bicne spcPSW, spcPSW, #flagT1
-			
-			@ timer 2
-		
-			ldr r12, =SPC_Timers
-			ldrb r0, [r12]
-			
-			tst r0, #0x04
-			beq noTimer2
-			ldrh r1, [r12, #0xE]
-			subs r1, r1, r3
-			strplh r1, [r12, #0xE]
-			bpl noTimer2
-			ldrh r2, [r12, #0x10]
-			add r1, r1, r2
-			strh r1, [r12, #0xE]
-			ldrb r1, [r12, #0x12]
-			add r1, r1, #1
-			strb r1, [r12, #0x12]
-
-noTimer2:
-			subs spcCycles, spcCycles, r3
-			bpl emuloop
-			
-		@ timers 0 and 1
-		
-		sub r4, r4, spcCycles
-		
-		ldr r12, [memory, #-4]
-		add r12, r12, r4
-		cmp r12, #0x4000
-		subge r12, r12, #0x4000
-		str r12, [memory, #-4]
-		blge DSP_BufferSwap
-		
-		ldr r12, =SPC_Timers
-		ldrb r0, [r12]
+		ldrb r0, [memory, #-8] @ timer enable
 		
 		tst r0, #0x01
 		beq noTimer0
-		ldrh r1, [r12, #0x2]
-		subs r1, r1, r4
-		strplh r1, [r12, #0x2]
-		bpl noTimer0
-		ldrh r2, [r12, #0x4]
-		add r1, r1, r2
-		strh r1, [r12, #0x2]
-		ldrb r1, [r12, #0x6]
-		add r1, r1, #1
-		strb r1, [r12, #0x6]
-		
+		ldr r1, [memory, #-20] @ timer value
+		add r1, r1, r3
+		tst r1, #0x8000 @ check if the timer overflowed
+		ldreq r2, [memory, #-32] @ timer reload
+		addeq r1, r1, r2
+		str r1, [memory, #-20]
 noTimer0:
+
 		tst r0, #0x02
 		beq noTimer1
-		ldrh r1, [r12, #0x8]
-		subs r1, r1, r4
-		strplh r1, [r12, #0x8]
-		bpl noTimer1
-		ldrh r2, [r12, #0xA]
-		add r1, r1, r2
-		strh r1, [r12, #0x8]
-		ldrb r1, [r12, #0xC]
-		add r1, r1, #1
-		strb r1, [r12, #0xC]
-		
+		ldr r1, [memory, #-16] @ timer value
+		add r1, r1, r3
+		tst r1, #0x8000 @ check if the timer overflowed
+		ldreq r2, [memory, #-28] @ timer reload
+		addeq r1, r1, r2
+		str r1, [memory, #-16]
 noTimer1:
-		ldr r3, [memory, #-8]
-		subs r3, r3, r4
-		str r3, [memory, #-8]
-		bpl bigemuloop
+
+		tst r0, #0x04
+		beq noTimer2
+		ldr r1, [memory, #-12] @ timer value
+		add r1, r1, r3
+		tst r1, #0x8000 @ check if the timer overflowed
+		ldreq r2, [memory, #-24] @ timer reload
+		addeq r1, r1, r2
+		str r1, [memory, #-12]
+noTimer2:
+
+		@debug
+		@ldr r0, =dbgcycles
+		@ldr r1, [r0]
+		@add r1, r1, r3
+		@str r1, [r0]
 		
+		ldr r0, [memory, #-4] @ elapsed cycles
+		add r0, r0, r3
+		cmp r0, #0x4000
+		subge r0, r0, #0x4000
+		str r0, [memory, #-4]
+		blge DSP_BufferSwap
+		
+		subs spcCycles, spcCycles, r3
+		bpl spcloop
+		
+spcpause:
 	StoreRegs
-	ldmia sp!, {r4-r12, pc}
+	ldmia sp!, {r3-r12, pc}
 		
 .ltorg
 	
@@ -529,8 +546,8 @@ OP_UNK:
 	MemRead8
 	mov r1, r12
 	bl SPC_ReportUnk
-blarg2:
-	b blarg2
+	sub spcPC, spcPC, #0x10000
+	b op_return
 	
 @ --- ADC ---------------------------------------------------------------------
 
@@ -776,6 +793,30 @@ OP_AND_DP_Imm:
 	AddCycles 5
 	b op_return
 	
+@ --- AND1 --------------------------------------------------------------------
+
+OP_AND1_C_ab:
+	Prefetch16
+	mov r1, r0, lsr #0xD
+	bic r0, r0, #0xE000
+	MemRead8
+	mov r2, #1
+	tst r0, r2, lsl r1
+	biceq spcPSW, spcPSW, #flagC
+	AddCycles 4
+	b op_return
+	
+OP_AND1_C_notab:
+	Prefetch16
+	mov r1, r0, lsr #0xD
+	bic r0, r0, #0xE000
+	MemRead8
+	mov r2, #1
+	tst r0, r2, lsl r1
+	bicne spcPSW, spcPSW, #flagC
+	AddCycles 4
+	b op_return
+	
 @ --- ASL ---------------------------------------------------------------------
 
 .macro DO_ASL src, op
@@ -954,9 +995,7 @@ OP_BBS_7:
 @ --- BRK ---------------------------------------------------------------------
 
 OP_BRK:
-	mov r0, #0x55
-blarg:
-	b blarg
+	b OP_UNK
 	
 @ --- CALL --------------------------------------------------------------------
 
@@ -1059,6 +1098,12 @@ OP_CMP_A_Imm:
 	GetOp_Imm
 	DO_CMP spcA, r0
 	AddCycles 2
+	b op_return
+	
+OP_CMP_A_mX:
+	GetOp_mX
+	DO_CMP spcA, r0
+	AddCycles 3
 	b op_return
 	
 OP_CMP_A_DP:
@@ -1449,6 +1494,19 @@ OP_EOR_DP_Imm:
 	DO_EOR r0, r1
 	mov r1, r0
 	MemWrite8 r2, r1
+	AddCycles 5
+	b op_return
+	
+@ --- EOR1 --------------------------------------------------------------------
+
+OP_EOR1_C_ab:
+	Prefetch16
+	mov r1, r0, lsr #0xD
+	bic r0, r0, #0xE000
+	MemRead8
+	mov r2, #1
+	tst r0, r2, lsl r1
+	eorne spcPSW, spcPSW, #flagC
 	AddCycles 5
 	b op_return
 	
@@ -1876,6 +1934,21 @@ OP_MOV_SP_X:
 	
 @ --- MOV1 --------------------------------------------------------------------
 
+OP_MOV1_ab_C:
+	Prefetch16
+	mov r1, r0, lsr #0xD
+	bic r0, r0, #0xE000
+	mov r12, r0
+	MemRead8
+	tst spcPSW, #flagC
+	mov r2, #1
+	biceq r1, r0, r2, lsl r1
+	orrne r1, r0, r2, lsl r1
+	mov r0, r12
+	MemWrite8
+	AddCycles 6
+	b op_return
+
 OP_MOV1_C_ab:
 	Prefetch16
 	mov r1, r0, lsr #0xD
@@ -1929,6 +2002,21 @@ OP_MUL_YA:
 
 OP_NOP:
 	AddCycles 2
+	b op_return
+	
+@ --- NOT1 --------------------------------------------------------------------
+
+OP_NOT1_ab:
+	Prefetch16
+	mov r1, r0, lsr #0xD
+	bic r0, r0, #0xE000
+	mov r12, r0
+	MemRead8
+	mov r2, #1
+	eor r1, r0, r2, lsl r1
+	mov r0, r12
+	MemWrite8
+	AddCycles 5
 	b op_return
 	
 @ --- NOTC --------------------------------------------------------------------
@@ -2037,6 +2125,30 @@ OP_OR_DP_Imm:
 	DO_OR r0, r1
 	mov r1, r0
 	MemWrite8 r2, r1
+	AddCycles 5
+	b op_return
+	
+@ --- OR1 ---------------------------------------------------------------------
+
+OP_OR1_C_ab:
+	Prefetch16
+	mov r1, r0, lsr #0xD
+	bic r0, r0, #0xE000
+	MemRead8
+	mov r2, #1
+	tst r0, r2, lsl r1
+	orrne spcPSW, spcPSW, #flagC
+	AddCycles 5
+	b op_return
+	
+OP_OR1_C_notab:
+	Prefetch16
+	mov r1, r0, lsr #0xD
+	bic r0, r0, #0xE000
+	MemRead8
+	mov r2, #1
+	tst r0, r2, lsl r1
+	orreq spcPSW, spcPSW, #flagC
 	AddCycles 5
 	b op_return
 	

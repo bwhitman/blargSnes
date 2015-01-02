@@ -45,10 +45,10 @@ SNES_IORead8:
 	beq DMA_Read8
 	
 	cmp r12, #0x4000
-	subeq snesCycles, snesCycles, #0x60000
+	addeq snesCycles, snesCycles, #0x60000
 	beq SNES_JoyRead8
 	
-	mov r0, r12, lsr #8	@ open bus
+	ldrb r0, [snesStatus, #LastBusVal]
 ior8_ret:
 	ldmia sp!, {r12, pc}
 	
@@ -69,10 +69,11 @@ SNES_IORead16:
 	beq DMA_Read16
 	
 	cmp r12, #0x4000
-	subeq snesCycles, snesCycles, #0xC0000
+	addeq snesCycles, snesCycles, #0xC0000
 	beq SNES_JoyRead16
 	
-	orr r0, r12, r12, lsr #8	@ open bus
+	ldrb r0, [snesStatus, #LastBusVal]
+	orr r0, r0, r0, lsl #8
 ior16_ret:
 	ldmia sp!, {r12, pc}
 	
@@ -90,17 +91,12 @@ SNES_IOWrite8:
 	beq DMA_Write8
 	
 	cmp r12, #0x4000
-	subeq snesCycles, snesCycles, #0x60000
+	addeq snesCycles, snesCycles, #0x60000
 	beq SNES_JoyWrite8
 	
 	cmp r12, #0x4200
-	ldmneia sp!, {r12, pc}
-	cmp r0, #0x00
-	bne SNES_GIOWrite8
-	tst r1, #0x80
-	bicne snesP, snesP, #flagI2
-	orreq snesP, snesP, #flagI2	
-	b SNES_GIOWrite8
+	beq SNES_GIOWrite8
+
 iow8_ret:
 	ldmia sp!, {r12, pc}
 
@@ -118,16 +114,11 @@ SNES_IOWrite16:
 	beq DMA_Write16
 	
 	cmp r12, #0x4000
-	subeq snesCycles, snesCycles, #0xC0000
+	addeq snesCycles, snesCycles, #0xC0000
 	beq SNES_JoyWrite16
 	
 	cmp r12, #0x4200
-	ldmneia sp!, {r12, pc}
-	cmp r0, #0x00
-	bne SNES_GIOWrite16
-	tst r1, #0x80
-	bicne snesP, snesP, #flagI2
-	orreq snesP, snesP, #flagI2
-	b SNES_GIOWrite16
+	beq SNES_GIOWrite16
+
 iow16_ret:
 	ldmia sp!, {r12, pc}
